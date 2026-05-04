@@ -47,13 +47,19 @@ Since the nodes cannot reach Docker Hub, images must be bundled on a machine wit
 ### A. Create the Image Bundle (Laptop with Internet)
 ```powershell
 docker pull rancher/mirrored-pause:3.6
+docker pull rancher/local-path-provisioner:v0.0.35
+docker pull rancher/mirrored-library-busybox:1.37.0
 docker save -o dist/images.tar `
   market-maker:1.0.0 `
   eclipse-temurin:21-jre-alpine `
   postgres:16-alpine `
   zookeeper:3.9 `
-  rancher/mirrored-pause:3.6
+  rancher/mirrored-pause:3.6 `
+  rancher/local-path-provisioner:v0.0.35 `
+  rancher/mirrored-library-busybox:1.37.0
 ```
+
+> **Note:** `local-path-provisioner` and `mirrored-library-busybox` are required for the postgres PVC to bind on an air-gapped cluster — without them, every JPA service in the stack will CrashLoopBackOff because postgres never reaches Ready. The exact tags above match this cluster's installed K3s; if K3s is upgraded, re-run `kubectl get deploy -n kube-system local-path-provisioner -o jsonpath='{...}'` to confirm the tags before bundling.
 ### B. Distribute and Import (Connected to Cluster)
 Run 
 ```powershell
