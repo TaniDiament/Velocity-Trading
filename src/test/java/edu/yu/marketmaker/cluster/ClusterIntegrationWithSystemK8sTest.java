@@ -103,7 +103,9 @@ class ClusterIntegrationWithSystemK8sTest {
         awaitHealthy("external-publisher",   PUBLISHER_PORT,     Duration.ofMinutes(5));
 
         for (Map.Entry<Integer, String> e : MM_PORT_TO_POD.entrySet()) {
-            awaitHealthy(e.getValue(), e.getKey(), Duration.ofMinutes(5));
+            // mm pods don't expose /health; /marketmaker/status returns 200
+            // once the Spring context is up and the pod has joined the cluster.
+            awaitHealthy(e.getValue(), e.getKey(), "/marketmaker/status", Duration.ofMinutes(5));
         }
 
         System.out.println("[E2E-k8s] waiting for 7-node cluster convergence...");
@@ -240,9 +242,13 @@ class ClusterIntegrationWithSystemK8sTest {
      * to make CI failures debuggable.
      */
     private static void awaitHealthy(String workload, int port, Duration timeout) throws Exception {
+        awaitHealthy(workload, port, "/health", timeout);
+    }
+
+    private static void awaitHealthy(String workload, int port, String path, Duration timeout) throws Exception {
         Instant deadline = Instant.now().plus(timeout);
         while (Instant.now().isBefore(deadline)) {
-            if (healthy(port)) {
+            if (healthy(port, path)) {
                 System.out.println("[E2E-k8s] " + workload + " healthy on " + HOST + ":" + port);
                 return;
             }
@@ -283,9 +289,13 @@ class ClusterIntegrationWithSystemK8sTest {
     }
 
     private static boolean healthy(int port) {
+        return healthy(port, "/health");
+    }
+
+    private static boolean healthy(int port, String path) {
         try {
             HttpRequest req = HttpRequest.newBuilder()
-                    .uri(URI.create("http://" + HOST + ":" + port + "/health"))
+                    .uri(URI.create("http://" + HOST + ":" + port + path))
                     .timeout(Duration.ofSeconds(3))
                     .GET().build();
             HttpResponse<String> resp = HTTP.send(req, HttpResponse.BodyHandlers.ofString());
