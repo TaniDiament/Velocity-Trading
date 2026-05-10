@@ -49,7 +49,6 @@ spec:
       labels:
         app: zk
     spec:
-      # --- ADDED AFFINITY BLOCK START ---
       affinity:
         nodeAffinity:
           requiredDuringSchedulingIgnoredDuringExecution:
@@ -57,7 +56,13 @@ spec:
               - matchExpressions:
                   - key: node-role.kubernetes.io/control-plane
                     operator: Exists
-      # --- ADDED AFFINITY BLOCK END ---
+      # Tolerate the control-plane taint we apply to cp1/cp2/cp3 so
+      # only ZK is scheduled there. Combined with the nodeAffinity above,
+      # this pins ZK to the control planes and excludes everything else.
+      tolerations:
+        - key: node-role.kubernetes.io/control-plane
+          operator: Exists
+          effect: NoSchedule
       containers:
         - name: zookeeper
           image: zookeeper:3.9
