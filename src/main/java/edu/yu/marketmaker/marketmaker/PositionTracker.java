@@ -1,6 +1,7 @@
 package edu.yu.marketmaker.marketmaker;
 
 import edu.yu.marketmaker.ha.LeaderAwareRSocketClient;
+import edu.yu.marketmaker.ha.LeaderElectionService;
 import edu.yu.marketmaker.model.StateSnapshot;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -27,9 +28,11 @@ public class PositionTracker implements SnapshotTracker {
     private final Set<String> trackedSymbols = ConcurrentHashMap.newKeySet();
 
     private final LeaderAwareRSocketClient client;
+    private final LeaderElectionService leaderElection;
 
-    public PositionTracker(LeaderAwareRSocketClient client) {
+    public PositionTracker(LeaderAwareRSocketClient client, LeaderElectionService leaderElection) {
         this.client = client;
+        this.leaderElection = leaderElection;
     }
 
     @Override
@@ -56,6 +59,12 @@ public class PositionTracker implements SnapshotTracker {
     }
 
     public Flux<StateSnapshot> getPositions() {
+        // The leader has no assigned symbols; don't subscribe.
+        if (leaderElection.isLeader()) {
+            log.debug("Skipping state.stream subscription: this node is the leader");
+            return Flux.empty();
+        }
+
         // Flux.defer so retries actually re-resolve the leader via the registry
         // cache instead of riding a dead TCP connection.
         return Flux.defer(() ->

@@ -63,8 +63,8 @@ public class ExchangeService {
         if (quoteRepository.get(symbol).isEmpty()) { // this is used for bootstrapping the quotes
             logger.info("Bootstrapping quote for: {}", quote.symbol());
             reservationRequester.sendReservation(quote);
+            quoteRepository.put(quote);
         }
-        quoteRepository.put(quote);
     }
 
     /**

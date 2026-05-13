@@ -40,11 +40,13 @@ public class ExposureReservationService {
             release(quote.symbol());
         }
 
-        // Calculate current bid and ask usage separately
+        // Calculate current bid and ask usage for this symbol only
         int currentBidUsage = reservations.getAll().stream()
+                .filter(r -> r.symbol().equals(quote.symbol()))
                 .mapToInt(Reservation::grantedBid)
                 .sum();
         int currentAskUsage = reservations.getAll().stream()
+                .filter(r -> r.symbol().equals(quote.symbol()))
                 .mapToInt(Reservation::grantedAsk)
                 .sum();
 

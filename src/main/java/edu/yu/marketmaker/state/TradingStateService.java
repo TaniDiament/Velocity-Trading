@@ -28,6 +28,8 @@ import reactor.core.publisher.Sinks;
 import java.util.Collection;
 import java.util.Optional;
 import java.util.UUID;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.Map;
 import edu.yu.marketmaker.ha.LeaderElectionService;
 
 /**
@@ -42,7 +44,8 @@ public class TradingStateService {
     private final Repository<String, Position> positionRepository;
     private final Repository<UUID, Fill> fillRepository;
     private final LeaderElectionService leaderElection;
-    
+    private final Map<String, Object> symbolLocks = new ConcurrentHashMap<>();
+
 
     /**
      * Hot multicast sink – every call to {@code submitFill} that results in a
@@ -108,27 +111,32 @@ public Mono<Void> submitFillRSocket(@Payload Fill fill) {
      * Shared logic for both HTTP and RSocket submitFill endpoints.
      * Persists the fill, updates the position, and broadcasts
      * a {@link StateSnapshot} to all active {@code state.stream} subscribers.
+     * Per-symbol locking ensures concurrent fills on the same symbol do not lose updates.
      *
      * @param fill the fill to process
      * @throws HazelcastException if the underlying repository fails
      */
     private void processFill(Fill fill) {
         logger.info("Processing fill: id={}, symbol={}, side={}, quantity={}", fill.getId(), fill.symbol(), fill.side(), fill.quantity());
-        Optional<Position> position = positionRepository.get(fill.symbol());
-        fillRepository.put(fill);
-        int quantity = fill.side() == Side.BUY ? fill.quantity() : -fill.quantity();
-        Position updatedPosition;
-        if (position.isPresent()) {
-            int newQuantity = position.get().netQuantity() + quantity;
-            updatedPosition = new Position(fill.symbol(), newQuantity, position.get().version() + 1, fill.getId());
-            logger.info("Updated existing position: symbol={}, newNetQuantity={}, version={}", updatedPosition.symbol(), updatedPosition.netQuantity(), updatedPosition.version());
-        } else {
-            updatedPosition = new Position(fill.symbol(), quantity, 0, fill.getId());
-            logger.info("Created new position: symbol={}, netQuantity={}", updatedPosition.symbol(), updatedPosition.netQuantity());
+        String symbol = fill.symbol();
+        Object lock = symbolLocks.computeIfAbsent(symbol, k -> new Object());
+        synchronized (lock) {
+            Optional<Position> position = positionRepository.get(symbol);
+            fillRepository.put(fill);
+            int quantity = fill.side() == Side.BUY ? fill.quantity() : -fill.quantity();
+            Position updatedPosition;
+            if (position.isPresent()) {
+                int newQuantity = position.get().netQuantity() + quantity;
+                updatedPosition = new Position(symbol, newQuantity, position.get().version() + 1, fill.getId());
+                logger.info("Updated existing position: symbol={}, newNetQuantity={}, version={}", updatedPosition.symbol(), updatedPosition.netQuantity(), updatedPosition.version());
+            } else {
+                updatedPosition = new Position(symbol, quantity, 0, fill.getId());
+                logger.info("Created new position: symbol={}, netQuantity={}", updatedPosition.symbol(), updatedPosition.netQuantity());
+            }
+            positionRepository.put(updatedPosition);
+            logger.info("Persisted position for symbol={}, emitting StateSnapshot to sink", symbol);
+            positionSink.tryEmitNext(new StateSnapshot(updatedPosition, fill));
         }
-        positionRepository.put(updatedPosition);
-        logger.info("Persisted position for symbol={}, emitting StateSnapshot to sink", fill.symbol());
-        positionSink.tryEmitNext(new StateSnapshot(updatedPosition, fill));
     }
 
     /**

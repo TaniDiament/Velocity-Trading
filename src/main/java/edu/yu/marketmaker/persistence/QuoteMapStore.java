@@ -26,7 +26,9 @@ public class QuoteMapStore implements MapStore<String, Quote> {
 
     @Override
     public void store(String key, Quote quote) {
-        // We use the UUID from the record for persistence identity
+        // Delete any existing quote for this symbol and insert the new one.
+        // This ensures only the latest quote per symbol persists.
+        quoteRepository.deleteBySymbol(key);
         QuoteEntity entity = QuoteEntity.fromRecord(quote);
         repository.save(entity);
     }

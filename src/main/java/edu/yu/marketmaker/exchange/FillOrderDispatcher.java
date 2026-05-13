@@ -16,6 +16,8 @@ import edu.yu.marketmaker.model.Quote;
 import edu.yu.marketmaker.model.Side;
 
 import java.util.UUID;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
 
 @Component
 @Profile("exchange")
@@ -26,6 +28,7 @@ public class FillOrderDispatcher implements OrderDispatcher {
     private final Repository<String, Quote> quoteRepository;
     private final FillSender fillSender;
     private final RSocketRequester reservationRequester;
+    private final Map<String, Object> symbolLocks = new ConcurrentHashMap<>();
 
     // Backward-compatible constructor used by isolated unit tests.
     public FillOrderDispatcher(Repository<String, Quote> repository, FillSender fillSender) {
@@ -50,39 +53,43 @@ public class FillOrderDispatcher implements OrderDispatcher {
     public void dispatchOrder(ExternalOrder order) {
         logger.info("Dispatching {} order: {} x {} @ {}",
             order.side(), order.symbol(), order.quantity(), order.limitPrice());
-        Quote quote = quoteRepository.get(order.symbol()).orElseThrow(() -> new OrderValidationException("Quote " + order.symbol() + " does not exist"));
-        long timestamp = System.currentTimeMillis();
-        if (timestamp >= quote.expiresAt()) {
-            throw new OrderValidationException("Quote " + order.symbol() + " is expired");
-        }
-        double price = 0.0;
-        switch (order.side()) {
-            case BUY:
-                if (order.limitPrice() < quote.askPrice()) {
-                    throw new OrderValidationException("Limit price too low to cross ask");
-                } else {
-                    price = quote.askPrice();
-                }
-                break;
-            case SELL:
-                if (order.limitPrice() > quote.bidPrice()) {
-                    throw new OrderValidationException("Limit price too high to cross bid");
-                } else {
-                    price = quote.bidPrice();
-                }
-        }
-        int adjustedQuantity = executableQuantity(quote, order);
-        if (adjustedQuantity == 0) {
-            throw new OrderValidationException("Order could not be filled");
-        }
+        String symbol = order.symbol();
+        Object lock = symbolLocks.computeIfAbsent(symbol, k -> new Object());
+        synchronized (lock) {
+            Quote quote = quoteRepository.get(symbol).orElseThrow(() -> new OrderValidationException("Quote " + symbol + " does not exist"));
+            long timestamp = System.currentTimeMillis();
+            if (timestamp >= quote.expiresAt()) {
+                throw new OrderValidationException("Quote " + symbol + " is expired");
+            }
+            double price = 0.0;
+            switch (order.side()) {
+                case BUY:
+                    if (order.limitPrice() < quote.askPrice()) {
+                        throw new OrderValidationException("Limit price too low to cross ask");
+                    } else {
+                        price = quote.askPrice();
+                    }
+                    break;
+                case SELL:
+                    if (order.limitPrice() > quote.bidPrice()) {
+                        throw new OrderValidationException("Limit price too high to cross bid");
+                    } else {
+                        price = quote.bidPrice();
+                    }
+            }
+            int adjustedQuantity = executableQuantity(quote, order);
+            if (adjustedQuantity == 0) {
+                throw new OrderValidationException("Order could not be filled");
+            }
 
-        Side marketMakerSide = order.side() == Side.BUY ? Side.SELL : Side.BUY;
+            Side marketMakerSide = order.side() == Side.BUY ? Side.SELL : Side.BUY;
 
-        releaseReservedExposure(order.symbol(), marketMakerSide, adjustedQuantity);
-        applyQuoteFill(quote, order.side(), adjustedQuantity);
+            releaseReservedExposure(symbol, marketMakerSide, adjustedQuantity);
+            applyQuoteFill(quote, order.side(), adjustedQuantity);
 
-        Fill fill = new Fill(order.id(), order.symbol(), marketMakerSide, adjustedQuantity, price, quote.quoteId(), timestamp);
-        fillSender.sendFill(fill);
+            Fill fill = new Fill(order.id(), symbol, marketMakerSide, adjustedQuantity, price, quote.quoteId(), timestamp);
+            fillSender.sendFill(fill);
+        }
     }
 
     private int executableQuantity(Quote quote, ExternalOrder order) {
