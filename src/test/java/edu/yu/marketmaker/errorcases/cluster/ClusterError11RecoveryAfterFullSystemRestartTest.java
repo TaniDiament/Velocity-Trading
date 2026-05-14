@@ -197,24 +197,30 @@ class ClusterError11RecoveryAfterFullSystemRestartTest {
                 + nonZeroPositionCount + " non-zero), " + preFillCount + " fills, "
                 + preExposure.activeReservations() + " active reservations");
 
-        // 4. Rolling-restart every app-tier workload. `kubectl rollout
-        //    restart` annotates the template causing kubelet to recreate
-        //    pods. zk + postgres are deliberately not in the list.
+        // 4-5. Rolling-restart every app-tier workload, **one StatefulSet at
+        //      a time**. `kubectl rollout restart` is non-blocking — firing
+        //      all 5 targets in a row before any `rollout status` wait would
+        //      put 4 different Hazelcast members (one per stateful tier) into
+        //      simultaneous restart. With backupCount=1 a partition whose
+        //      primary and backup happen to live on two of those bouncing
+        //      pods loses both copies before migration completes, and any
+        //      in-flight IMap.put whose MapStore.store hadn't committed dies
+        //      with the JVM (fill sends are fire-and-forget over RSocket, so
+        //      the exchange never learns the trading-state write was lost).
+        //      Serializing — restart + wait, then move on — keeps at most one
+        //      Hazelcast member bouncing at a time, which is what the
+        //      backupCount=1 (now 2) replication can survive.
+        //      zk + postgres are deliberately not in the list.
         for (String target : RESTART_TARGETS) {
             System.out.println("[ERR11-k8s] kubectl rollout restart " + target);
             String out = runKubectl(TimeUnit.SECONDS.toMillis(30),
                     "rollout", "restart", target, "-n", NS);
             System.out.println("[ERR11-k8s]   " + out.trim());
-        }
 
-        // 5. Wait for the rollout to complete on each workload. `kubectl
-        //    rollout status` blocks until the new generation reaches its
-        //    desired ready replicas.
-        for (String target : RESTART_TARGETS) {
             System.out.println("[ERR11-k8s] kubectl rollout status " + target + " (waiting)...");
-            String out = runKubectl(TimeUnit.MINUTES.toMillis(10),
+            String status = runKubectl(TimeUnit.MINUTES.toMillis(10),
                     "rollout", "status", target, "-n", NS, "--timeout=10m");
-            System.out.println("[ERR11-k8s]   " + out.trim());
+            System.out.println("[ERR11-k8s]   " + status.trim());
         }
 
         // 6. Same health gate as @BeforeAll — Spring context refresh must

@@ -268,10 +268,10 @@ Execute `ClusterIntegrationWithSystemK8sTest.java`.
 
 1) Network: Connect laptop to the Mango Router.
 
-2) IntelliJ VM Options: You must point the test to the physical Master IPs. Add this to your Run Configuration:
+2) IntelliJ VM Options: You must point the test to the physical IP. Add this to your Run Configuration:
 
 Plaintext
-`-Dzk.hosts=192.168.8.11:2181,192.168.8.12:2181,192.168.8.13:2181`
+`-Dcluster.k8s.host=192.168.8.11`
 
 3) Run: The test will interface with the cluster, injecting orders and validating distributed state across the 14 nodes.
 

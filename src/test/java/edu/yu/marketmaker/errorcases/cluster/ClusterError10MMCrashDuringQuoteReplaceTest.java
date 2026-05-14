@@ -162,14 +162,24 @@ class ClusterError10MMCrashDuringQuoteReplaceTest {
             Thread.sleep(WAVE_INTERVAL_MS);
         }
 
-        // 2. Pick the crash target dynamically: whichever symbol the
-        //    highest-ordinal pod (TARGET_POD) currently owns. We crash that
-        //    pod and then `kubectl scale sts/mm --replicas=TARGET_REPLICAS`,
-        //    which removes the highest-ordinal pod and prevents kubelet from
-        //    recreating it — the closest k3s analogue to local docker-compose
-        //    leaving the dead container down.
+        // 2. Pick the crash target: whichever symbol the highest-ordinal pod
+        //    (TARGET_POD) currently owns. We crash that pod and then
+        //    `kubectl scale sts/mm --replicas=TARGET_REPLICAS`, which removes
+        //    the highest-ordinal pod and prevents kubelet from recreating it —
+        //    the closest k3s analogue to local docker-compose leaving the dead
+        //    container down.
+        //
+        //    Edge case: the ZK leader latch is FIFO-by-join-time and the
+        //    cluster leader gets *no* symbol assignments. If startup-order
+        //    racing or a post-convergence leader transfer leaves TARGET_POD
+        //    holding the leader latch, it'll own nothing and the test can't
+        //    proceed. ensureTargetIsWorker() detects that by inspecting the
+        //    leaderId reported by /cluster/status; if TARGET_POD is the
+        //    leader, it `kubectl delete pod` the leader so it rejoins at the
+        //    back of the latch queue, then waits for the cluster to settle.
         diagnosticTarget = TARGET_POD;
-        String targetSymbol = firstSymbolOwnedBy(TARGET_PORT);
+        ensureTargetIsWorker();
+        String targetSymbol = awaitTargetSymbol();
         assertNotNull(targetSymbol,
                 TARGET_POD + " owns no symbols after warmup; cannot pick a crash target. "
                         + "Either symbols < pods or rebalancing is still in progress.");
@@ -387,6 +397,91 @@ class ClusterError10MMCrashDuringQuoteReplaceTest {
                 "scale", "sts/mm", "-n", NS, "--replicas=" + replicas);
         System.out.println("[ERR10-k8s] kubectl scale sts/mm --replicas=" + replicas + ": "
                 + out.trim());
+    }
+
+    /**
+     * Inspect /cluster/status on any responsive MM and return the leader's
+     * nodeId, or null if no quorum/leader currently visible.
+     */
+    private static String currentLeaderId() {
+        for (int port : MM_PORT_TO_POD.keySet()) {
+            JsonNode status = clusterStatusOrNull(port);
+            if (status == null) continue;
+            String lid = status.path("leaderId").asText(null);
+            if (lid != null && !lid.isBlank()) return lid;
+        }
+        return null;
+    }
+
+    /**
+     * If {@link #TARGET_POD} currently holds the cluster leader latch it
+     * receives no symbol assignments (only workers are assigned), and the
+     * crash-target selection further down would fail with a confusing
+     * "owns no symbols" message.
+     *
+     * <p>Delete the pod via kubectl so it loses the latch. The StatefulSet
+     * recreates it; on rejoin it lands at the back of the FIFO leader latch
+     * queue, so a different pod is elected leader and TARGET_POD becomes an
+     * eligible worker again. Then we wait for the cluster to converge and
+     * for TARGET_POD's status endpoint to come back.
+     *
+     * <p>No-op if TARGET_POD is already a worker.
+     */
+    private static void ensureTargetIsWorker() throws Exception {
+        String leader = currentLeaderId();
+        if (leader == null) {
+            System.out.println("[ERR10-k8s] no leader visible yet — relying on outer awaitCondition to converge");
+            return;
+        }
+        if (!TARGET_POD.equals(leader)) {
+            System.out.println("[ERR10-k8s] " + TARGET_POD + " is a worker (leader=" + leader + ") — proceeding");
+            return;
+        }
+        System.out.println("[ERR10-k8s] " + TARGET_POD + " currently holds the leader latch — "
+                + "deleting the pod to drop it (a different pod will take over so " + TARGET_POD
+                + " can be assigned a symbol)");
+        String out = runKubectlCapturing(TimeUnit.SECONDS.toMillis(30),
+                "delete", "pod", TARGET_POD, "-n", NS, "--wait=true");
+        System.out.println("[ERR10-k8s]   " + out.trim());
+
+        // StatefulSet recreates the pod under the same name and stable
+        // network identity. Wait for the readiness probe to pass before
+        // checking the cluster again.
+        awaitHealthy(TARGET_POD, TARGET_PORT, "/marketmaker/status", Duration.ofMinutes(5));
+
+        // Wait for re-election to settle (leader is no longer TARGET_POD).
+        awaitCondition(Duration.ofMinutes(2), () -> {
+            String lid = currentLeaderId();
+            return lid != null && !TARGET_POD.equals(lid);
+        }, "after deleting " + TARGET_POD + ", the cluster did not elect a different leader within 2m");
+        System.out.println("[ERR10-k8s] re-election complete; new leader=" + currentLeaderId());
+    }
+
+    /**
+     * Poll {@link #firstSymbolOwnedBy} until {@link #TARGET_POD} reports an
+     * assigned symbol, or the timeout elapses. Returns the symbol, or null on
+     * timeout. Used right after {@link #ensureTargetIsWorker}, which
+     * guarantees TARGET_POD is *eligible* for assignment but not that the
+     * Coordinator has already issued one — the rebalance znode write and the
+     * AssignmentListener pickup are async.
+     */
+    private static String awaitTargetSymbol() {
+        Instant deadline = Instant.now().plus(Duration.ofMinutes(2));
+        while (Instant.now().isBefore(deadline)) {
+            try {
+                String s = firstSymbolOwnedBy(TARGET_PORT);
+                if (s != null) return s;
+            } catch (Exception ignored) {
+                // transient HTTP error — retry
+            }
+            try {
+                Thread.sleep(1000);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                return null;
+            }
+        }
+        return null;
     }
 
     @org.junit.jupiter.api.AfterAll
@@ -708,10 +803,14 @@ class ClusterError10MMCrashDuringQuoteReplaceTest {
         // configured. Otherwise (kubectl.ssh="") run the local kubectl.
         List<String> cmd = new ArrayList<>();
         if (KUBECTL_SSH != null && !KUBECTL_SSH.isBlank()) {
-            // Build a single shell-string argument so quoting on the remote
-            // side matches what the install docs use.
+            // ssh passes a single shell-string to the remote shell. Each
+            // kubectl arg must be POSIX-shell-quoted, otherwise args
+            // containing spaces (e.g. `sh -c "wget -qO- http://..."`) split
+            // on the remote side: `sh -c wget -qO- http://...` parses as
+            // `sh -c wget` with the rest as positional args, so wget runs
+            // with no URL and prints its usage page.
             StringBuilder remote = new StringBuilder(KUBECTL_REMOTE);
-            for (String a : args) remote.append(' ').append(a);
+            for (String a : args) remote.append(' ').append(shellQuote(a));
             for (String token : KUBECTL_SSH.split(" +")) cmd.add(token);
             cmd.add(remote.toString());
         } else {
@@ -732,6 +831,14 @@ class ClusterError10MMCrashDuringQuoteReplaceTest {
             output.append("[timed out waiting for kubectl command]\n");
         }
         return output.toString();
+    }
+
+    /**
+     * POSIX-shell-quote a single argument: wrap in single quotes and replace
+     * any embedded {@code '} with {@code '\''}. Safe for any string content.
+     */
+    private static String shellQuote(String s) {
+        return "'" + s.replace("'", "'\\''") + "'";
     }
 
     private static List<UUID> seedQuotes(List<String> symbols) throws Exception {
