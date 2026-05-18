@@ -1,5 +1,7 @@
 *.class
 *.claude
+.cursor
+.cursorj
 build/
 target/
 .idea/
