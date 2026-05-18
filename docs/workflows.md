@@ -54,16 +54,18 @@ sequenceDiagram
   user1->>exchange: Submit BUY order (qty=8)
   user2->>exchange: Submit BUY order (qty=8)
   Note over exchange: Quote askQuantity = 10
+  Note over exchange: Per-symbol monitor (symbolLocks) serializes both threads
+  exchange->>exchange: Thread 1 acquires lock for symbol
   exchange->>exchange: Thread 1: adjustedQty = min(8, 10) = 8
   exchange->>exchange: Thread 1: update quote askQty = 2
   exchange->>state: Send fill (qty=8)
+  exchange->>exchange: Thread 1 releases lock
+  exchange->>exchange: Thread 2 acquires lock, re-reads askQty = 2
   exchange->>exchange: Thread 2: adjustedQty = min(8, 2) = 2
   exchange->>exchange: Thread 2: update quote askQty = 0
   exchange->>state: Send fill (qty=2)
-  Note over exchange: Without synchronization on quote updates,
-  Note over exchange: race conditions could cause over-fills
 ```
-**Outcome:** If the exchange does not synchronize access to the quote's remaining quantity, two concurrent orders could both read the same remaining quantity and over-fill. Proper locking or atomic operations on the quote are needed to prevent this.
+**Outcome:** `FillOrderDispatcher` serializes all order handling for a given symbol through a per-symbol `synchronized` monitor (`symbolLocks`). The second thread always observes the already-decremented remaining quantity, so its fill is clamped to whatever is left (possibly zero, in which case `OrderValidationException("Order could not be filled")` is thrown). Over-fills cannot occur.
 
 ---
 
@@ -133,52 +135,63 @@ sequenceDiagram
 ### Quote expires before it can be refreshed
 ```mermaid
 sequenceDiagram
+  participant keeper as QuoteFreshnessKeeper (in MM)
   participant maker as Market Maker Node
   participant reservation as Exposure Reservation Service
   participant exchange as Exchange Service
   Note over exchange: Active quote TTL = 30s
-  Note over exchange: 30 seconds pass with no refresh
-  exchange->>exchange: Quote expires, no longer fillable
-  maker->>maker: Detect quote expiration
-  maker->>reservation: Release reservation (POST /reservations/{id}/release)
-  reservation->>reservation: Free capacity
+  Note over keeper: Periodic tick (refresh-interval-ms)
+  keeper->>keeper: For each assigned symbol, check expiresAt - now < staleThresholdMs
+  keeper->>maker: Trigger refresh for stale symbol
   maker->>maker: Generate fresh quote
-  maker->>reservation: Request new reservation
-  reservation->>maker: Granted
-  maker->>exchange: Publish new quote (PUT /quotes/{symbol})
+  maker->>reservation: POST /reservations (atomically supersedes prior reservation for symbol)
+  reservation->>maker: ReservationResponse (granted, status)
+  maker->>exchange: PUT /quotes/{symbol}
 ```
-**Outcome:** When a quote expires, the exchange stops filling it. The market maker detects this and releases the associated reservation, then publishes a fresh quote. This is normal lifecycle behavior.
+**Outcome:** `QuoteFreshnessKeeper` polls each MM-owned symbol on a fixed interval and refreshes any quote whose `expiresAt - now` is under `marketmaker.quote-stale-threshold-ms` (default 15s). The new reservation request **atomically supersedes** the prior one for that symbol on the reservation service — no explicit release call is issued in the non-fault path. The explicit `POST /reservations/{symbol}/release` only fires from fault-injection paths (`ProductionQuoteGenerator`) and on fill via `apply-fill`.
 
 ---
 
 ## Streaming Position Data Updates
+
+The `trading-state` service publishes position updates over two independent transports:
+
+- **STOMP over SockJS WebSocket** (`/ws`) — used by the browser-based Position Display UI (`static/index.html`). Clients receive an initial snapshot via `SUBSCRIBE /app/positions.snapshot` and live deltas via `SUBSCRIBE /topic/positions`.
+- **RSocket request-stream** on route `state.stream` (TCP port 7000) — used by **market-maker pods** (`PositionTracker.java`) to consume the same updates internally.
+
+Both transports are fed from the same `Sinks.Many<StateSnapshot>` multicast publisher inside `TradingStateService`, so all subscribers see identical data.
+
 ```mermaid
 sequenceDiagram
-  participant frontend as Frontend
+  participant ui as Position UI (browser)
+  participant mm as Market Maker pod
   participant state as Trading State Service
   participant exchange as Exchange Service
-  frontend->>state: Create connection
-  loop Until connection is closed
+  ui->>state: SockJS+STOMP connect (/ws), SUBSCRIBE /topic/positions
+  mm->>state: RSocket request-stream (route state.stream)
+  loop Until disconnect
     exchange->>state: Send fill
-    state->>state: Generate position
-    state->>frontend: Send position update
+    state->>state: Update position, emit StateSnapshot to multicast sink
+    state->>ui: STOMP frame on /topic/positions
+    state->>mm: RSocket onNext(StateSnapshot)
   end
-  frontend->>state: Close connection
 ```
 
 ### UI connects but no positions exist yet
 ```mermaid
 sequenceDiagram
-  participant frontend as Position Display UI
+  participant ui as Position Display UI
   participant state as Trading State Service
-  frontend->>state: Connect (RSocket state.stream)
+  ui->>state: SockJS+STOMP connect (/ws)
+  ui->>state: SUBSCRIBE /app/positions.snapshot
   state->>state: No positions in repository
-  state->>frontend: Empty initial snapshot
-  Note over frontend: UI shows empty state / "No positions"
+  state->>ui: Empty initial snapshot (JSON [])
+  ui->>state: SUBSCRIBE /topic/positions
+  Note over ui: UI shows empty state
   Note over state: Later, first fill arrives
-  state->>state: Create first position
-  state->>frontend: Send StateSnapshot (first position)
-  Note over frontend: UI updates to show new position
+  state->>state: Create first position, emit StateSnapshot
+  state->>ui: STOMP frame on /topic/positions
+  Note over ui: UI flashes new row
 ```
 **Outcome:** The UI handles the empty state gracefully and updates dynamically as positions are created.
 
@@ -188,14 +201,13 @@ sequenceDiagram
   participant ui1 as UI Client 1
   participant ui2 as UI Client 2
   participant state as Trading State Service
-  ui1->>state: Connect (RSocket state.stream)
-  ui2->>state: Connect (RSocket state.stream)
-  state->>ui1: Current position snapshot
-  state->>ui2: Current position snapshot
-  Note over state: Fill arrives
-  state->>state: Update position
-  state->>ui1: StateSnapshot broadcast
-  state->>ui2: StateSnapshot broadcast
-  Note over state: Both clients see the same data
+  ui1->>state: SockJS+STOMP connect, SUBSCRIBE /topic/positions
+  ui2->>state: SockJS+STOMP connect, SUBSCRIBE /topic/positions
+  state->>ui1: Initial snapshot via /app/positions.snapshot
+  state->>ui2: Initial snapshot via /app/positions.snapshot
+  Note over state: Fill arrives, position updated
+  state->>state: Emit StateSnapshot to multicast sink
+  state->>ui1: STOMP frame on /topic/positions
+  state->>ui2: STOMP frame on /topic/positions
 ```
-**Outcome:** The multicast sink broadcasts to all connected subscribers. All UI clients see consistent, real-time position data.
+**Outcome:** The multicast `Sinks.Many<StateSnapshot>` fans out to every active STOMP subscriber (and every RSocket subscriber on `state.stream`). All UI clients see consistent, real-time position data.
