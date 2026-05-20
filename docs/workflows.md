@@ -22,12 +22,13 @@ sequenceDiagram
   participant user as External Order Publisher
   participant exchange as Exchange Service
   user->>exchange: Submit order (POST /orders)
+  exchange->>exchange: Acquire per-symbol monitor
   exchange->>exchange: Look up active quote
-  exchange->>exchange: Check expiresAt < currentTime
-  Note over exchange: Quote has expired
-  exchange->>user: Reject: "Quote is expired"
+  exchange->>exchange: Check now >= expiresAt
+  Note over exchange: Quote has expired (boundary is inclusive)
+  exchange->>user: Reject: "Quote {symbol} is expired"
 ```
-**Outcome:** The exchange checks `expiresAt` before matching. Expired quotes are never filled. The publisher receives a 400 error and may retry later when a fresh quote is available.
+**Outcome:** `FillOrderDispatcher` rejects with `OrderValidationException` whenever `System.currentTimeMillis() >= quote.expiresAt()` — equality counts as expired. `ExchangeServiceAdvice` maps the exception to HTTP 400. The publisher may retry once a fresh quote is published.
 
 ### Order quantity exceeds remaining quote quantity (partial fill)
 ```mermaid
@@ -54,16 +55,18 @@ sequenceDiagram
   user1->>exchange: Submit BUY order (qty=8)
   user2->>exchange: Submit BUY order (qty=8)
   Note over exchange: Quote askQuantity = 10
+  Note over exchange: Per-symbol monitor (symbolLocks) serializes both threads
+  exchange->>exchange: Thread 1 acquires lock for symbol
   exchange->>exchange: Thread 1: adjustedQty = min(8, 10) = 8
   exchange->>exchange: Thread 1: update quote askQty = 2
   exchange->>state: Send fill (qty=8)
+  exchange->>exchange: Thread 1 releases lock
+  exchange->>exchange: Thread 2 acquires lock, re-reads askQty = 2
   exchange->>exchange: Thread 2: adjustedQty = min(8, 2) = 2
   exchange->>exchange: Thread 2: update quote askQty = 0
   exchange->>state: Send fill (qty=2)
-  Note over exchange: Without synchronization on quote updates,
-  Note over exchange: race conditions could cause over-fills
 ```
-**Outcome:** If the exchange does not synchronize access to the quote's remaining quantity, two concurrent orders could both read the same remaining quantity and over-fill. Proper locking or atomic operations on the quote are needed to prevent this.
+**Outcome:** `FillOrderDispatcher` serializes all order handling for a given symbol through a per-symbol `synchronized` monitor (`symbolLocks`). The second thread always observes the already-decremented remaining quantity, so its fill is clamped to whatever is left (possibly zero, in which case `OrderValidationException("Order could not be filled")` is thrown). Over-fills cannot occur.
 
 ---
 
@@ -89,15 +92,14 @@ sequenceDiagram
   participant reservation as Exposure Reservation Service
   participant exchange as Exchange Service
   state->>maker: Position update (position = -80)
-  maker->>maker: Generate quote: bid=10, ask=10
-  maker->>reservation: Request reservation (ask=10)
-  reservation->>reservation: Available capacity = 5
-  reservation->>maker: Partial grant (granted=5, status=PARTIAL)
-  maker->>maker: Reduce ask quantity to 5
-  maker->>exchange: Publish quote (bid=10, ask=5)
-  exchange->>exchange: Activate reduced quote
+  maker->>maker: Generate quote: bid=10, ask=10<br/>(after ±100 per-symbol clamp: bidMax=180, askMax=20)
+  maker->>reservation: Request reservation (bid=10, ask=10)
+  reservation->>reservation: Available ask capacity = 5<br/>(firm-wide ask budget nearly exhausted)
+  reservation->>maker: Partial grant (grantedBid=10, grantedAsk=5, status=PARTIAL)
+  maker->>maker: Overwrite quote quantities with granted amounts
+  maker->>exchange: Publish quote (bid=10, ask=5) via shared Hazelcast map
 ```
-**Outcome:** When insufficient exposure capacity exists, the reservation service grants only what is available. The market maker deterministically reduces the quote quantity to match and publishes a smaller quote. This prevents exposure limit violations while still providing some liquidity.
+**Outcome:** Every reservation request carries both sides. When the firm-wide budget on one side is short, the reservation service grants only what is available on that side. `ProductionQuoteGenerator` always overwrites the proposed `bidQuantity` / `askQuantity` with `reservation.grantedBidQuantity()` / `grantedAskQuantity()` before saving, so the published quote can never exceed what was granted.
 
 ### Reservation denied entirely
 ```mermaid
@@ -107,14 +109,16 @@ sequenceDiagram
   participant reservation as Exposure Reservation Service
   state->>maker: Position update
   maker->>maker: Generate quote: bid=10, ask=10
-  maker->>reservation: Request reservation (ask=10)
-  reservation->>reservation: Available capacity = 0
-  reservation->>maker: Denied (granted=0, status=DENIED)
-  Note over maker: Cannot publish quote
-  Note over maker: Allow existing quote to expire
-  Note over maker: Retry on next position update
+  maker->>reservation: Request reservation (bid=10, ask=10)
+  reservation->>reservation: Atomically release any prior reservation for this symbol
+  reservation->>reservation: Available bid=0, ask=0 (firm-wide budgets exhausted)
+  reservation->>maker: Response (grantedBid=0, grantedAsk=0, status=DENIED)
+  maker->>maker: Overwrite quote quantities with granted amounts (0/0)
+  maker->>exchange: Publish quote (bid qty=0, ask qty=0) via shared Hazelcast map
+  Note over exchange: Any incoming order will be rejected with<br/>"Order could not be filled" (adjustedQty == 0)
+  Note over maker: Next fill-driven or freshness-tick refresh re-attempts
 ```
-**Outcome:** No exposure capacity is available. The market maker cannot publish a quote for this symbol. The existing quote (if any) expires naturally. The market maker will retry when it receives the next position update or when capacity becomes available.
+**Outcome:** `ProductionQuoteGenerator` does **not** branch on `status` — it unconditionally writes a quote with the granted quantities (zero on both sides here) to the shared quote map. The prior reservation for this symbol was already released atomically inside `createReservation`. The exchange still sees an active, unexpired quote, but every incoming order fails the `adjustedQty == 0` check in `FillOrderDispatcher` and is rejected with `"Order could not be filled"`. The MM tries again on the next position update or, in a quiet market, on the next `QuoteFreshnessKeeper` tick.
 
 ### Stale position update arrives after a newer one
 ```mermaid
@@ -124,61 +128,74 @@ sequenceDiagram
   state->>maker: Position update (version=5)
   maker->>maker: Process and publish quote for version 5
   state->>maker: Position update (version=4, delayed/reordered)
-  maker->>maker: Check: version 4 < last seen version 5
-  maker->>maker: Discard stale update
+  maker->>maker: Check: incoming(4) > lastSeen(5)? — no
+  maker->>maker: Discard update
   Note over maker: Quote from version 5 remains active
 ```
-**Outcome:** The market maker tracks the last processed position version per symbol. Updates with older versions are discarded to prevent stale quotes from overriding newer state.
+**Outcome:** `MarketMaker.newVersion` only accepts a snapshot when `incoming > prev`, so **both older and equal-version snapshots are discarded** — a re-delivery of the same version after a `state.stream` reconnect will not re-trigger quoting either. This prevents stale or duplicated snapshots from overriding the freshest known position.
 
 ### Quote expires before it can be refreshed
 ```mermaid
 sequenceDiagram
-  participant maker as Market Maker Node
+  participant keeper as QuoteFreshnessKeeper (in MM)
+  participant state as Trading State Service
+  participant generator as ProductionQuoteGenerator
   participant reservation as Exposure Reservation Service
   participant exchange as Exchange Service
   Note over exchange: Active quote TTL = 30s
-  Note over exchange: 30 seconds pass with no refresh
-  exchange->>exchange: Quote expires, no longer fillable
-  maker->>maker: Detect quote expiration
-  maker->>reservation: Release reservation (POST /reservations/{id}/release)
-  reservation->>reservation: Free capacity
-  maker->>maker: Generate fresh quote
-  maker->>reservation: Request new reservation
-  reservation->>maker: Granted
-  maker->>exchange: Publish new quote (PUT /quotes/{symbol})
+  Note over keeper: Periodic tick (quote-refresh-interval-ms, default 10s)
+  keeper->>keeper: For each assigned symbol, check expiresAt - now < quote-stale-threshold-ms (default 15s)
+  keeper->>state: Fetch latest position (RSocket "positions.{symbol}")
+  state->>keeper: Position (or default with version=-1 if absent)
+  keeper->>generator: generateQuote(position, lastFill=null)
+  generator->>reservation: RSocket "reservations" (bid+ask)<br/>(atomically supersedes prior reservation for symbol)
+  reservation->>generator: ReservationResponse (granted, status)
+  generator->>exchange: Write reserved quote to shared Hazelcast map
 ```
-**Outcome:** When a quote expires, the exchange stops filling it. The market maker detects this and releases the associated reservation, then publishes a fresh quote. This is normal lifecycle behavior.
+**Outcome:** `QuoteFreshnessKeeper` polls each MM-owned symbol on a fixed interval and refreshes any quote whose `expiresAt - now` is under `marketmaker.quote-stale-threshold-ms` (default 15s) — including quotes already past expiry or missing entirely. It bypasses `MarketMaker.handlePosition` (so the fill-ordering version tracker isn't polluted) and instead fetches a fresh position from the leader and calls `QuoteGenerator.generateQuote` directly. The new reservation request **atomically supersedes** the prior one for that symbol — no explicit release call is issued in the non-fault path. The explicit `reservations.{symbol}.release` route only fires from fault-injection paths (`ProductionQuoteGenerator` Error Case 10), and fills are netted via `apply-fill` rather than full release.
 
 ---
 
 ## Streaming Position Data Updates
+
+The `trading-state` service publishes position updates over two independent transports:
+
+- **STOMP over SockJS WebSocket** (`/ws`) — used by the browser-based Position Display UI (`static/index.html`). Clients receive an initial snapshot via `SUBSCRIBE /app/positions.snapshot` and live deltas via `SUBSCRIBE /topic/positions`.
+- **RSocket request-stream** on route `state.stream` (TCP port 7000) — used by **market-maker pods** (`PositionTracker.java`) to consume the same updates internally.
+
+Both transports are fed from the same `Sinks.Many<StateSnapshot>` multicast publisher inside `TradingStateService`, so all subscribers see identical data.
+
 ```mermaid
 sequenceDiagram
-  participant frontend as Frontend
+  participant ui as Position UI (browser)
+  participant mm as Market Maker pod
   participant state as Trading State Service
   participant exchange as Exchange Service
-  frontend->>state: Create connection
-  loop Until connection is closed
+  ui->>state: SockJS+STOMP connect (/ws), SUBSCRIBE /topic/positions
+  mm->>state: RSocket request-stream (route state.stream)
+  loop Until disconnect
     exchange->>state: Send fill
-    state->>state: Generate position
-    state->>frontend: Send position update
+    state->>state: Update position, emit StateSnapshot to multicast sink
+    state->>ui: STOMP frame on /topic/positions
+    state->>mm: RSocket onNext(StateSnapshot)
   end
-  frontend->>state: Close connection
 ```
 
 ### UI connects but no positions exist yet
 ```mermaid
 sequenceDiagram
-  participant frontend as Position Display UI
+  participant ui as Position Display UI
   participant state as Trading State Service
-  frontend->>state: Connect (RSocket state.stream)
+  ui->>state: SockJS+STOMP connect (/ws)
+  ui->>state: SUBSCRIBE /app/positions.snapshot
   state->>state: No positions in repository
-  state->>frontend: Empty initial snapshot
-  Note over frontend: UI shows empty state / "No positions"
+  state->>ui: Empty initial snapshot (JSON [])
+  ui->>state: SUBSCRIBE /topic/positions
+  Note over ui: UI shows empty state
   Note over state: Later, first fill arrives
-  state->>state: Create first position
-  state->>frontend: Send StateSnapshot (first position)
-  Note over frontend: UI updates to show new position
+  state->>state: Create first position, emit StateSnapshot
+  state->>ui: STOMP frame on /topic/positions
+  Note over ui: UI flashes new row
 ```
 **Outcome:** The UI handles the empty state gracefully and updates dynamically as positions are created.
 
@@ -188,14 +205,13 @@ sequenceDiagram
   participant ui1 as UI Client 1
   participant ui2 as UI Client 2
   participant state as Trading State Service
-  ui1->>state: Connect (RSocket state.stream)
-  ui2->>state: Connect (RSocket state.stream)
-  state->>ui1: Current position snapshot
-  state->>ui2: Current position snapshot
-  Note over state: Fill arrives
-  state->>state: Update position
-  state->>ui1: StateSnapshot broadcast
-  state->>ui2: StateSnapshot broadcast
-  Note over state: Both clients see the same data
+  ui1->>state: SockJS+STOMP connect, SUBSCRIBE /topic/positions
+  ui2->>state: SockJS+STOMP connect, SUBSCRIBE /topic/positions
+  state->>ui1: Initial snapshot via /app/positions.snapshot
+  state->>ui2: Initial snapshot via /app/positions.snapshot
+  Note over state: Fill arrives, position updated
+  state->>state: Emit StateSnapshot to multicast sink
+  state->>ui1: STOMP frame on /topic/positions
+  state->>ui2: STOMP frame on /topic/positions
 ```
-**Outcome:** The multicast sink broadcasts to all connected subscribers. All UI clients see consistent, real-time position data.
+**Outcome:** The multicast `Sinks.Many<StateSnapshot>` fans out to every active STOMP subscriber (and every RSocket subscriber on `state.stream`). All UI clients see consistent, real-time position data.

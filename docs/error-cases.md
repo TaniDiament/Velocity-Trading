@@ -232,18 +232,16 @@ sequenceDiagram
   participant exchange as Exchange Service
   participant maker as Market Maker Node
   Note over pg: PostgreSQL starts (data is durable)
-  state->>pg: Start — Hazelcast MapStore loads positions, fills
-  reservation->>pg: Start — load reservations from DB
-  reservation->>reservation: Scan and expire stale reservations
-  reservation->>reservation: Rebuild global exposure totals
-  exchange->>pg: Start — load quotes from DB
-  exchange->>exchange: Expire any quotes past TTL
+  state->>pg: Start — Hazelcast MapStore eager-loads positions, fills
+  reservation->>pg: Start — Hazelcast MapStore eager-loads reservations
+  exchange->>pg: Start — Hazelcast MapStore eager-loads quotes (TTL may have lapsed during downtime)
   maker->>state: Connect to state.stream
-  state->>maker: Send current position snapshot
-  maker->>maker: Generate quotes for all handled symbols
-  maker->>reservation: Request fresh reservations
+  state->>maker: Initial snapshot (current Position + lastFill per symbol)
+  Note over maker: AssignmentListener.bootstrapQuoteForNewlyAssigned: skip if a non-expired durable quote already exists; otherwise regen.
+  maker->>maker: ProductionQuoteGenerator: expired survivor → treated as null → cold-start defaults (defaultQuantity, referencePrice=100)
+  maker->>reservation: Request fresh reservation (atomically supersedes any pre-restart entry for this symbol)
   reservation->>maker: Grant / partial / deny
-  maker->>exchange: Publish new quotes
-  Note over maker: System converges to correct state
+  maker->>exchange: Publish new quote (write-through to postgres)
+  Note over maker: System resumes accepting orders against the refreshed quotes
 ```
-**Outcome:** After a full restart, each service rebuilds from durable storage (PostgreSQL via Hazelcast MapStore). The exposure reservation service must scan for and expire stale reservations to prevent leaked capacity. The exchange expires old quotes. Market makers reconnect, receive current positions, and republish quotes. The system converges without manual intervention.
+**Outcome:** Each service rebuilds from durable storage via `MapStoreConfig.InitialLoadMode.EAGER`. There is no separate startup pass to "scan and expire" stale entries — quote expiry is handled lazily on read (the exchange's `FillOrderDispatcher` rejects orders against expired quotes, and `ProductionQuoteGenerator` treats an expired survivor as if no quote existed when it regenerates). Reservation exposure totals are derived on every `createReservation` call by summing `Reservation.grantedBid/grantedAsk` across the loaded `reservations` IMap, so the global capacity is correct as soon as the MapStore finishes its eager load. Market makers reconnect to `state.stream`, receive the position snapshot (with `lastFill`, enabling inventory-aware skew on the first regen), and resume quoting. End-to-end coverage lives in `ClusterError11RecoveryAfterFullSystemRestartTest` / `LocalError11RecoveryAfterFullSystemRestartTest`; the cluster variant intentionally does **not** restart `sts/zk` or `sts/postgres` because those are the durable layer being relied on.

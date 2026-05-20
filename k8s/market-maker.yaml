@@ -170,7 +170,11 @@ spec:
                 fieldRef:
                   fieldPath: metadata.name
             - name: SPRING_PROFILES_ACTIVE
-              value: "market-maker-node,production-quote-generator"
+              # fault-injection is a test-only profile. Including it here
+              # only registers FaultInjector + FaultInjectionController as
+              # beans; the hook stays disarmed (no-op) until the error-case
+              # 10 integration test explicitly POSTs to /test/fault-injection.
+              value: "market-maker-node,production-quote-generator,fault-injection"
             - name: ZOOKEEPER_CONNECT
               value: "zk-0.zk-hs:2181,zk-1.zk-hs:2181,zk-2.zk-hs:2181"
             # Pod-stable DNS used by peers to open the leader->worker forward.

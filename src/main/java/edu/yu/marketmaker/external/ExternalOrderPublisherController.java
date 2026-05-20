@@ -67,6 +67,16 @@ public class ExternalOrderPublisherController {
     private final ObjectMapper mapper = new ObjectMapper();
     private HttpClient http;
 
+    /**
+     * Last diagnostic message from a non-200 / exception path in
+     * {@link #submitOrders}. Surfaced via {@code GET /publisher/last-failure}
+     * so an e2e assertion that sees {@code accepted=0} can include the actual
+     * exchange-side response in its failure message without scraping pod logs.
+     * Volatile because submit waves and the GET endpoint run on different
+     * Tomcat threads.
+     */
+    private volatile String lastFailureSample = "";
+
     public ExternalOrderPublisherController(ServiceRegistry serviceRegistry) {
         this.serviceRegistry = serviceRegistry;
     }
@@ -120,6 +130,12 @@ public class ExternalOrderPublisherController {
             @RequestBody List<String> symbols) {
         int accepted = 0;
         int rejected = 0;
+        // Capture the first non-200 body we see so a 100%-rejected wave
+        // (the error-case-11 failure mode) leaves a concrete server-side
+        // diagnostic in the publisher log — otherwise we'd only see the
+        // "accepted=0" count with no way to tell whether it's 400 / 500 /
+        // 503 / transport error.
+        String firstFailureSample = null;
         Random rnd = new Random();
         for (int i = 0; i < count; i++) {
             for (String symbol : symbols) {
@@ -134,15 +150,40 @@ public class ExternalOrderPublisherController {
                         accepted++;
                     } else {
                         rejected++;
+                        if (firstFailureSample == null) {
+                            firstFailureSample = "HTTP " + resp.statusCode() + " " + resp.body();
+                        }
+                        logger.warn("order rejected for {} ({}@{}): HTTP {} {}",
+                                symbol, side, limitPrice, resp.statusCode(), resp.body());
                     }
                 } catch (Exception e) {
                     rejected++;
-                    logger.debug("order submit failed for {}: {}", symbol, e.getMessage());
+                    if (firstFailureSample == null) {
+                        firstFailureSample = "EXCEPTION " + e.getClass().getSimpleName() + ": " + e.getMessage();
+                    }
+                    logger.warn("order submit threw for {} ({}@{}): {}",
+                            symbol, side, limitPrice, e.toString());
                 }
             }
         }
-        logger.info("Submitted orders: accepted={}, rejected={}", accepted, rejected);
+        logger.info("Submitted orders: accepted={}, rejected={}, firstFailure={}",
+                accepted, rejected, firstFailureSample);
+        if (firstFailureSample != null) {
+            this.lastFailureSample = firstFailureSample;
+        }
         return ResponseEntity.ok(accepted);
+    }
+
+    /**
+     * @return the first non-200 response body (or exception summary) seen by
+     *         the most recent {@link #submitOrders} wave that had any
+     *         rejections. Empty string if the publisher has only seen 200s
+     *         since startup. Used by e2e tests to surface the exchange-side
+     *         reason for an unexpected 0-accepted wave.
+     */
+    @GetMapping("/publisher/last-failure")
+    public ResponseEntity<String> lastFailure() {
+        return ResponseEntity.ok(lastFailureSample);
     }
 
     /**

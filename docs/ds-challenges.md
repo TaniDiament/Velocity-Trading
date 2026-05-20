@@ -34,5 +34,7 @@
 ### 5. Availability & Fault Tolerance
 **Challenge:** Maintaining system uptime during individual component failures.
 * **Implementation:**
-    * **State Rebuild:** The Exposure service can rebuild its global totals by scanning active transactions in the database upon startup.
-    * **Fail-Safe Expiration:** The Exchange automatically rejects trades against expired quotes if a Market Maker node stops refreshing.
+    * **Durable Hazelcast MapStores:** Every IMap (`positions`, `fills`, `quotes`, `reservations`, `external-orders`) is write-through to PostgreSQL (`writeDelaySeconds=0`) and eager-loaded on startup (`InitialLoadMode.EAGER`). After a full system restart every service rebuilds in-memory state from the durable rows — see Error Case 11 in [`error-cases.md`](error-cases.md).
+    * **Leader election with standby guard:** Each stateful tier (`trading-state`, `exchange`, `exposure-reservation`) runs N replicas behind a ZK `LeaderLatch`. `LeaderGuardFilter` rejects mutating HTTP / RSocket calls on standbys with **503** so a stale client can't race a write into a non-leader.
+    * **Fail-safe quote expiration:** The exchange rejects orders against expired quotes (`FillOrderDispatcher` checks `expiresAt`); the market-maker treats an expired survivor as nonexistent when it regenerates (`ProductionQuoteGenerator`), so a stuck MM never republishes a stale quote.
+    * **TTL'd quote freshness keeper:** `QuoteFreshnessKeeper` polls each MM-owned symbol and refreshes any quote within `quote-stale-threshold-ms` of expiry, breaking the chicken-and-egg of "no fill → no regen → quote expires → still no fill."

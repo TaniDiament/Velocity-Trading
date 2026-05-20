@@ -1,28 +1,13 @@
-# Headlamp: web UI for the cluster.
-#
-# Deploys into the market-maker namespace (the kustomization.yaml at the root
-# of k8s/ rewrites everything to this namespace). The ClusterRoleBinding still
-# grants cluster-wide read/write through the ServiceAccount, so the UI sees
-# all namespaces, not just market-maker.
-#
-# Access from your laptop after `kubectl apply -k`:
-#   1) Browse to http://<any-node-ip>:30090
-#   2) On the login screen, paste the token printed by:
-#      doas env KUBECONFIG=/etc/rancher/k3s/k3s.yaml kubectl -n market-maker create token headlamp
-#
-# The image must be present in containerd on whichever node Headlamp lands on
-# — see docs/installation.md for the bundle list.
-
 apiVersion: v1
 kind: ServiceAccount
 metadata:
   name: headlamp
-  namespace: market-maker
+  namespace: headlamp
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
 metadata:
-  name: headlamp-admin
+  name: headlamp-ns-admin
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: ClusterRole
@@ -30,13 +15,13 @@ roleRef:
 subjects:
   - kind: ServiceAccount
     name: headlamp
-    namespace: market-maker
+    namespace: headlamp
 ---
 apiVersion: v1
 kind: Service
 metadata:
   name: headlamp
-  namespace: market-maker
+  namespace: headlamp
 spec:
   type: NodePort
   selector:
@@ -51,7 +36,7 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: headlamp
-  namespace: market-maker
+  namespace: headlamp
 spec:
   replicas: 1
   selector:

@@ -149,8 +149,16 @@ public class HazelcastConfig {
         evictionConfig.setMaxSizePolicy(MaxSizePolicy.PER_NODE);
         mapConfig.setEvictionConfig(evictionConfig);
 
-        // Backup configuration
-        mapConfig.setBackupCount(1);
+        // Backup configuration. Two synchronous backups so each partition has
+        // three copies. The full-system-restart test (error case 11) rolling-
+        // restarts four stateful tiers (trading-state, exposure-reservation,
+        // exchange, mm) that all share one 16-member Hazelcast cluster; even
+        // when restarts are serialized per StatefulSet, partition migration
+        // overlaps with the readiness probe and a partition whose primary +
+        // single backup land on adjacent-bouncing members can lose both
+        // copies before persistence catches up. Three copies survive two
+        // simultaneous member failures, which is the worst case here.
+        mapConfig.setBackupCount(2);
         mapConfig.setAsyncBackupCount(0);
     }
 

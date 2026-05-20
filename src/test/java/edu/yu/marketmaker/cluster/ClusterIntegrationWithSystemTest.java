@@ -41,8 +41,8 @@ import java.util.SortedMap;
 import java.util.TreeMap;
 import java.util.TreeSet;
 import java.util.UUID;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
-import java.util.function.BooleanSupplier;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -59,18 +59,15 @@ import static org.junit.jupiter.api.Assertions.fail;
  * exchange, external-publisher, and 7 market-maker nodes running the
  * {@code production-quote-generator} profile.
  *
- * <p>Order-submission strategy (matches the k8s variant): orders are POSTed directly
- * to the exchange — never through the publisher's bulk {@code /publisher/submit-orders}
- * endpoint — and are split per wave into:
- * <ul>
- *   <li>{@code SELF_CROSS_PAIRS_PER_WAVE} BUY/SELL pairs at {@link #SELF_CROSS_PRICE},
- *       priced inside the MM's spread so the two external orders match each other and
- *       leave MM exposure untouched.</li>
- *   <li>One "wide" order per wave whose side alternates, priced to cross the MM's
- *       quote — this keeps the MM engaged while balancing flow so net position
- *       oscillates around zero rather than running into the ±100 exposure cap and
- *       saturating the production quote generator.</li>
- * </ul>
+ * <p>Order-submission strategy: orders are POSTed directly to the exchange — never
+ * through the publisher's bulk {@code /publisher/submit-orders} endpoint. Each wave
+ * submits exactly one order per symbol; the side alternates per wave (BUY @
+ * {@link #WIDE_BUY_LIMIT} on odd waves, SELL @ {@link #WIDE_SELL_LIMIT} on even
+ * waves). Limits are set to cross both the bootstrap spread (99.50/100.50) and any
+ * tighter MM quote, and the alternation keeps net position oscillating near zero so
+ * the MM doesn't saturate against its ±100 exposure cap. The exchange has no
+ * peer-matching logic — every order must cross the MM's quote — so each fill drives
+ * a position snapshot back to the MM, which is what triggers quote refresh.
  *
  * <p>Assertions:
  * <ul>
@@ -111,8 +108,6 @@ class ClusterIntegrationWithSystemTest {
 
     private static final int TOTAL_WAVES = 50;
     private static final long WAVE_INTERVAL_MS = 1500;
-    private static final int SELF_CROSS_PAIRS_PER_WAVE = 5;
-    private static final double SELF_CROSS_PRICE = 100.00;
     private static final double WIDE_BUY_LIMIT = 101.00;
     private static final double WIDE_SELL_LIMIT = 99.00;
 
@@ -176,8 +171,7 @@ class ClusterIntegrationWithSystemTest {
         assertEquals(0, rcMm, "docker compose up (market-maker nodes) failed");
 
         System.out.println("[E2E] waiting for 7-node cluster convergence...");
-        awaitCondition(Duration.ofMinutes(8), ClusterIntegrationWithSystemTest::allNodesConverged,
-                "cluster did not converge within 8 minutes");
+        awaitClusterConvergence(Duration.ofMinutes(6));
         System.out.println("[E2E] full stack up.");
     }
 
@@ -231,33 +225,18 @@ class ClusterIntegrationWithSystemTest {
             long waveStart = System.currentTimeMillis();
             int accepted = 0;
             for (String symbol : SEED_SYMBOLS) {
-                int pairsAccepted = 0;
-                for (int i = 0; i < SELF_CROSS_PAIRS_PER_WAVE; i++) {
-                    int qty = 1 + rnd.nextInt(3);
-                    if (postOrderToExchange(new ExternalOrder(
-                            UUID.randomUUID(), symbol, qty, SELF_CROSS_PRICE, Side.BUY))) {
-                        accepted++;
-                    }
-                    if (postOrderToExchange(new ExternalOrder(
-                            UUID.randomUUID(), symbol, qty, SELF_CROSS_PRICE, Side.SELL))) {
-                        accepted++;
-                        pairsAccepted++;
-                    }
-                }
-                Side wideSide = (wave % 2 == 1) ? Side.BUY : Side.SELL;
-                double wideLimit = wideSide == Side.BUY ? WIDE_BUY_LIMIT : WIDE_SELL_LIMIT;
-                int wideQty = 1 + rnd.nextInt(3);
-                boolean wideAccepted = postOrderToExchange(new ExternalOrder(
-                        UUID.randomUUID(), symbol, wideQty, wideLimit, wideSide));
-                if (wideAccepted) accepted++;
+                Side side = (wave % 2 == 1) ? Side.BUY : Side.SELL;
+                double limit = side == Side.BUY ? WIDE_BUY_LIMIT : WIDE_SELL_LIMIT;
+                int qty = 1 + rnd.nextInt(3);
+                boolean ok = postOrderToExchange(new ExternalOrder(
+                        UUID.randomUUID(), symbol, qty, limit, side));
+                if (ok) accepted++;
 
                 eventLog.get(symbol).add(new TimedLine(waveStart,
-                        "ORDERS wave=" + wave
-                                + " self-cross=" + pairsAccepted + "/" + SELF_CROSS_PAIRS_PER_WAVE
-                                + "pairs@" + String.format("%.2f", SELF_CROSS_PRICE)
-                                + " wide=" + wideSide + "@" + String.format("%.2f", wideLimit)
-                                + " qty=" + wideQty
-                                + (wideAccepted ? "" : " (rejected)")));
+                        "ORDER wave=" + wave
+                                + " " + side + "@" + String.format("%.2f", limit)
+                                + " qty=" + qty
+                                + (ok ? "" : " (rejected)")));
             }
             System.out.println("[E2E] wave " + wave + ": exchange accepted " + accepted + " orders");
 
@@ -328,6 +307,21 @@ class ClusterIntegrationWithSystemTest {
 
         System.out.println("[E2E] symbols with fills: " + symbolsWithFills);
         System.out.println("[E2E] symbols with MM-generated quote in exchange: " + firstMmQuoteBySymbol.keySet());
+        printOrderRejectionSummary();
+        if (symbolsWithFills.isEmpty()) {
+            for (String exch : List.of("exchange-1", "exchange-2", "exchange-3")) {
+                System.err.println("---- docker compose logs --tail 300 " + exch + " (grep Dispatch/Limit) ----");
+                String logs = runDockerCapturing(TimeUnit.MINUTES.toMillis(1),
+                        "compose", "logs", "--tail", "300", exch);
+                for (String line : logs.split("\n")) {
+                    if (line.contains("Dispatching") || line.contains("Limit price")
+                            || line.contains("expired") || line.contains("Quote ")
+                            || line.contains("ERROR") || line.contains("Exception")) {
+                        System.err.println(line);
+                    }
+                }
+            }
+        }
 
         assertEquals(SEED_SYMBOLS, symbolsWithFills,
                 "every seed symbol must have at least one fill in trading-state; "
@@ -415,19 +409,78 @@ class ClusterIntegrationWithSystemTest {
 
     // ---------- helpers ----------
 
-    private static boolean allNodesConverged() {
-        int responding = 0;
-        Set<String> leaders = new HashSet<>();
-        for (int port : MM_PORT_TO_SERVICE.keySet()) {
-            JsonNode status = clusterStatusOrNull(port);
-            if (status == null) return false;
-            responding++;
-            String lid = status.path("leaderId").asText(null);
-            if (lid == null) return false;
-            leaders.add(lid);
-            if (status.path("members").size() != MM_PORT_TO_SERVICE.size()) return false;
+    /**
+     * Polls /cluster/status on every MM node until: all 7 respond, all agree on a single
+     * leaderId, and each reports {@code MM_PORT_TO_SERVICE.size()} members. On timeout,
+     * dumps the last-seen status per node and tails MM container logs so the failure
+     * isn't an opaque "did not converge".
+     */
+    private static void awaitClusterConvergence(Duration timeout) throws Exception {
+        Instant deadline = Instant.now().plus(timeout);
+        Map<Integer, JsonNode> lastStatus = new LinkedHashMap<>();
+        Map<Integer, String> lastError = new LinkedHashMap<>();
+        while (Instant.now().isBefore(deadline)) {
+            lastStatus.clear();
+            lastError.clear();
+            int responding = 0;
+            Set<String> leaders = new HashSet<>();
+            boolean allMembersFull = true;
+            boolean allHaveLeader = true;
+            for (int port : MM_PORT_TO_SERVICE.keySet()) {
+                JsonNode status;
+                try {
+                    status = clusterStatusOrNull(port);
+                } catch (Exception e) {
+                    lastError.put(port, e.toString());
+                    status = null;
+                }
+                if (status == null) {
+                    lastError.putIfAbsent(port, "no response");
+                    continue;
+                }
+                lastStatus.put(port, status);
+                responding++;
+                String lid = status.path("leaderId").asText(null);
+                if (lid == null) {
+                    allHaveLeader = false;
+                } else {
+                    leaders.add(lid);
+                }
+                if (status.path("members").size() != MM_PORT_TO_SERVICE.size()) {
+                    allMembersFull = false;
+                }
+            }
+            if (responding == MM_PORT_TO_SERVICE.size()
+                    && allHaveLeader
+                    && allMembersFull
+                    && leaders.size() == 1) {
+                return;
+            }
+            Thread.sleep(1000);
         }
-        return responding == MM_PORT_TO_SERVICE.size() && leaders.size() == 1;
+
+        System.err.println("[E2E] cluster did not converge within " + timeout);
+        System.err.println("---- per-node /cluster/status (last poll) ----");
+        for (Map.Entry<Integer, String> svc : MM_PORT_TO_SERVICE.entrySet()) {
+            int port = svc.getKey();
+            JsonNode s = lastStatus.get(port);
+            if (s != null) {
+                String leader = s.path("leaderId").asText("<none>");
+                int members = s.path("members").size();
+                System.err.println("  " + svc.getValue() + " (port " + port + "): leaderId="
+                        + leader + " members=" + members + " body=" + s);
+            } else {
+                System.err.println("  " + svc.getValue() + " (port " + port + "): UNREACHABLE ("
+                        + lastError.getOrDefault(port, "unknown") + ")");
+            }
+        }
+        for (String service : MM_PORT_TO_SERVICE.values()) {
+            System.err.println("---- docker compose logs --tail 200 " + service + " ----");
+            System.err.println(runDockerCapturing(TimeUnit.MINUTES.toMillis(1),
+                    "compose", "logs", "--tail", "200", service));
+        }
+        System.err.println("---- end convergence diagnostics ----");
+        throw new AssertionError("cluster did not converge within " + timeout);
     }
 
     private static JsonNode clusterStatusOrNull(int port) {
@@ -509,6 +562,13 @@ class ClusterIntegrationWithSystemTest {
                 .build();
         HttpResponse<String> resp = HTTP.send(req, HttpResponse.BodyHandlers.ofString());
         if (resp.statusCode() != 200) {
+            System.err.println("[E2E] seed-quotes failed: " + resp.statusCode() + " " + resp.body());
+            for (String service : List.of("external-publisher", "exchange-1", "exchange-2", "exchange-3")) {
+                System.err.println("---- docker compose logs --tail 200 " + service + " ----");
+                System.err.println(runDockerCapturing(TimeUnit.MINUTES.toMillis(1),
+                        "compose", "logs", "--tail", "200", service));
+            }
+            System.err.println("---- end seed-quotes diagnostics ----");
             fail("seed-quotes returned " + resp.statusCode() + ": " + resp.body());
         }
         return JSON.readValue(resp.body(), new TypeReference<List<UUID>>() {});
@@ -519,20 +579,57 @@ class ClusterIntegrationWithSystemTest {
      * (the exchange accepted the order — it may have filled, partially filled,
      * or been booked). Non-200 / transport error → false.
      */
+    // Per-status rejection counters + a sample order/body for each distinct status seen.
+    private static final Map<Integer, Integer> REJECTION_COUNTS = new ConcurrentHashMap<>();
+    private static final Map<Integer, String> REJECTION_SAMPLES = new ConcurrentHashMap<>();
+
+    static void printOrderRejectionSummary() {
+        if (REJECTION_COUNTS.isEmpty()) return;
+        System.err.println("[E2E] order rejection summary:");
+        REJECTION_COUNTS.forEach((status, count) ->
+                System.err.println("  status=" + status + " count=" + count
+                        + " sample=" + REJECTION_SAMPLES.get(status)));
+    }
+
     private static boolean postOrderToExchange(ExternalOrder order) {
+        // The 3 exchange replicas sit behind nginx round-robin (compose.yml -> service-lb).
+        // Only the leader accepts POSTs; the other two return 503 via LeaderGuardFilter.
+        // Retry briefly so a single round-robin miss doesn't drop the order.
+        long deadline = System.currentTimeMillis() + 2_000;
+        int lastStatus = -1;
+        String lastBody = null;
+        Exception lastEx = null;
         try {
             String body = JSON.writeValueAsString(order);
-            HttpRequest req = HttpRequest.newBuilder()
-                    .uri(URI.create("http://localhost:" + EXCHANGE_PORT + "/orders"))
-                    .header("Content-Type", "application/json")
-                    .timeout(Duration.ofSeconds(10))
-                    .POST(HttpRequest.BodyPublishers.ofString(body))
-                    .build();
-            HttpResponse<String> resp = HTTP.send(req, HttpResponse.BodyHandlers.ofString());
-            return resp.statusCode() == 200;
+            while (System.currentTimeMillis() < deadline) {
+                HttpRequest req = HttpRequest.newBuilder()
+                        .uri(URI.create("http://localhost:" + EXCHANGE_PORT + "/orders"))
+                        .header("Content-Type", "application/json")
+                        .timeout(Duration.ofSeconds(10))
+                        .POST(HttpRequest.BodyPublishers.ofString(body))
+                        .build();
+                try {
+                    HttpResponse<String> resp = HTTP.send(req, HttpResponse.BodyHandlers.ofString());
+                    lastStatus = resp.statusCode();
+                    lastBody = resp.body();
+                    if (lastStatus == 200) return true;
+                    if (lastStatus != 503) break; // non-503 non-200: real reject, don't retry
+                } catch (Exception e) {
+                    lastEx = e;
+                }
+                Thread.sleep(50);
+            }
         } catch (Exception e) {
-            return false;
+            lastEx = e;
         }
+        int key = lastEx != null ? -1 : lastStatus;
+        REJECTION_COUNTS.merge(key, 1, Integer::sum);
+        REJECTION_SAMPLES.putIfAbsent(key,
+                "order=" + order.side() + " " + order.symbol() + " qty=" + order.quantity()
+                        + " @ " + order.limitPrice()
+                        + " body=" + lastBody
+                        + (lastEx != null ? " exception=" + lastEx : ""));
+        return false;
     }
 
     private static List<Fill> getAllFills() throws Exception {
@@ -600,20 +697,6 @@ class ClusterIntegrationWithSystemTest {
             throw new AssertionError("timeout running: " + String.join(" ", cmd));
         }
         return p.exitValue();
-    }
-
-    private static void awaitCondition(Duration timeout, BooleanSupplier condition, String failureMessage) {
-        Instant deadline = Instant.now().plus(timeout);
-        while (Instant.now().isBefore(deadline)) {
-            if (condition.getAsBoolean()) return;
-            try {
-                Thread.sleep(1000);
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-                break;
-            }
-        }
-        throw new AssertionError(failureMessage);
     }
 
     private record TimedLine(long epochMillis, String text) {}

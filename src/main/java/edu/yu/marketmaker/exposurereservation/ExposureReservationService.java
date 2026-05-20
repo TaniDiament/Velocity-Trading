@@ -40,7 +40,11 @@ public class ExposureReservationService {
             release(quote.symbol());
         }
 
-        // Calculate current bid and ask usage separately
+        // Each side is capped at MAX_RESERVATION_LIMIT *globally* across all
+        // symbols (see class javadoc and unit tests). Summing without a
+        // per-symbol filter is required so that aggregate usage never exceeds
+        // capacity; getExposureState() also reports the global sum, so the
+        // two would otherwise disagree.
         int currentBidUsage = reservations.getAll().stream()
                 .mapToInt(Reservation::grantedBid)
                 .sum();

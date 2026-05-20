@@ -31,6 +31,7 @@ import java.util.Collection;
 import java.util.Map;
 import java.util.Optional;
 import java.util.UUID;
+import java.util.concurrent.ConcurrentHashMap;
 import edu.yu.marketmaker.ha.LeaderElectionService;
 import edu.yu.marketmaker.ha.ServiceRegistry;
 
@@ -46,6 +47,7 @@ public class TradingStateService {
     private final Repository<String, Position> positionRepository;
     private final Repository<UUID, Fill> fillRepository;
     private final LeaderElectionService leaderElection;
+    private final Map<String, Object> symbolLocks = new ConcurrentHashMap<>();
     private final ServiceRegistry serviceRegistry;
     private final ObjectProvider<SimpMessagingTemplate> messagingProvider;
     private final RestClient exchangeClient;
@@ -67,64 +69,64 @@ public class TradingStateService {
      * @param positionRepository
      * @param fillRepository
      */
-public TradingStateService(Repository<String, Position> positionRepository,
-                           Repository<UUID, Fill> fillRepository,
-                           LeaderElectionService leaderElection,
-                           ServiceRegistry serviceRegistry,
-                           ObjectProvider<SimpMessagingTemplate> messagingProvider,
-                           @Value("${exchange.base-url:http://exchange:8080}") String exchangeBaseUrl) {
-    this.positionRepository = positionRepository;
-    this.fillRepository = fillRepository;
-    this.leaderElection = leaderElection;
-    this.serviceRegistry = serviceRegistry;
-    this.messagingProvider = messagingProvider;
-    this.exchangeClient = RestClient.builder().baseUrl(exchangeBaseUrl).build();
-}
-
-/**
- * Bridges the in-memory {@link #positionSink} to the STOMP topic
- * {@code /topic/positions} so browser UIs can receive live updates.
- * <p>
- * Only the leader replica actually publishes. The bridge is (re)started on
- * leader acquisition and torn down on leader loss, so non-leader replicas
- * never push state to UI clients even though their sinks would still emit.
- */
-@PostConstruct
-void initWebSocketBridge() {
-    SimpMessagingTemplate messaging = messagingProvider.getIfAvailable();
-    if (messaging == null) {
-        logger.info("No SimpMessagingTemplate present — WebSocket bridge disabled");
-        return;
+    public TradingStateService(Repository<String, Position> positionRepository,
+                               Repository<UUID, Fill> fillRepository,
+                               LeaderElectionService leaderElection,
+                               ServiceRegistry serviceRegistry,
+                               ObjectProvider<SimpMessagingTemplate> messagingProvider,
+                               @Value("${exchange.base-url:http://exchange:8080}") String exchangeBaseUrl) {
+        this.positionRepository = positionRepository;
+        this.fillRepository = fillRepository;
+        this.leaderElection = leaderElection;
+        this.serviceRegistry = serviceRegistry;
+        this.messagingProvider = messagingProvider;
+        this.exchangeClient = RestClient.builder().baseUrl(exchangeBaseUrl).build();
     }
-    leaderElection.addListener(new LeaderElectionService.LeadershipListener() {
-        @Override public void onLeaderAcquired() { startBridge(messaging); }
-        @Override public void onLeaderLost()    { stopBridge(); }
-    });
-    if (leaderElection.isLeader()) {
-        startBridge(messaging);
+
+    /**
+     * Bridges the in-memory {@link #positionSink} to the STOMP topic
+     * {@code /topic/positions} so browser UIs can receive live updates.
+     * <p>
+     * Only the leader replica actually publishes. The bridge is (re)started on
+     * leader acquisition and torn down on leader loss, so non-leader replicas
+     * never push state to UI clients even though their sinks would still emit.
+     */
+    @PostConstruct
+    void initWebSocketBridge() {
+        SimpMessagingTemplate messaging = messagingProvider.getIfAvailable();
+        if (messaging == null) {
+            logger.info("No SimpMessagingTemplate present — WebSocket bridge disabled");
+            return;
+        }
+        leaderElection.addListener(new LeaderElectionService.LeadershipListener() {
+            @Override public void onLeaderAcquired() { startBridge(messaging); }
+            @Override public void onLeaderLost()    { stopBridge(); }
+        });
+        if (leaderElection.isLeader()) {
+            startBridge(messaging);
+        }
     }
-}
 
-private synchronized void startBridge(SimpMessagingTemplate messaging) {
-    if (bridgeSubscription != null && !bridgeSubscription.isDisposed()) return;
-    logger.info("Starting WebSocket position bridge — /topic/positions");
-    bridgeSubscription = positionSink.asFlux()
-            .publishOn(Schedulers.boundedElastic())
-            .subscribe(
-                    snap -> messaging.convertAndSend("/topic/positions", snap),
-                    err  -> logger.error("WebSocket bridge errored", err));
-}
-
-private synchronized void stopBridge() {
-    if (bridgeSubscription != null) {
-        logger.info("Stopping WebSocket position bridge — leader lost");
-        bridgeSubscription.dispose();
-        bridgeSubscription = null;
+    private synchronized void startBridge(SimpMessagingTemplate messaging) {
+        if (bridgeSubscription != null && !bridgeSubscription.isDisposed()) return;
+        logger.info("Starting WebSocket position bridge — /topic/positions");
+        bridgeSubscription = positionSink.asFlux()
+                .publishOn(Schedulers.boundedElastic())
+                .subscribe(
+                        snap -> messaging.convertAndSend("/topic/positions", snap),
+                        err  -> logger.error("WebSocket bridge errored", err));
     }
-}
 
-@PreDestroy
-void shutdownBridge() { stopBridge(); }
+    private synchronized void stopBridge() {
+        if (bridgeSubscription != null) {
+            logger.info("Stopping WebSocket position bridge — leader lost");
+            bridgeSubscription.dispose();
+            bridgeSubscription = null;
+        }
+    }
+
+    @PreDestroy
+    void shutdownBridge() { stopBridge(); }
 
     /**
      * HTTP: submit a fill via POST /state/fills
@@ -149,45 +151,50 @@ void shutdownBridge() { stopBridge(); }
      * @param fill the fill to record
      * @return {@link Mono} that completes empty on success, or errors on invalid input
      */
-@MessageMapping("state.fills")
-public Mono<Void> submitFillRSocket(@Payload Fill fill) {
-    if (!leaderElection.isLeader()) {
-        logger.warn("Rejecting RSocket fill {} — this replica is not the leader", fill.getId());
-        return Mono.error(new IllegalStateException("not leader"));
+    @MessageMapping("state.fills")
+    public Mono<Void> submitFillRSocket(@Payload Fill fill) {
+        if (!leaderElection.isLeader()) {
+            logger.warn("Rejecting RSocket fill {} — this replica is not the leader", fill.getId());
+            return Mono.error(new IllegalStateException("not leader"));
+        }
+        try {
+            processFill(fill);
+            return Mono.empty();
+        } catch (IllegalArgumentException | HazelcastException e) {
+            return Mono.error(e);
+        }
     }
-    try {
-        processFill(fill);
-        return Mono.empty();
-    } catch (IllegalArgumentException | HazelcastException e) {
-        return Mono.error(e);
-    }
-}
 
     /**
      * Shared logic for both HTTP and RSocket submitFill endpoints.
      * Persists the fill, updates the position, and broadcasts
      * a {@link StateSnapshot} to all active {@code state.stream} subscribers.
+     * Per-symbol locking ensures concurrent fills on the same symbol do not lose updates.
      *
      * @param fill the fill to process
      * @throws HazelcastException if the underlying repository fails
      */
     private void processFill(Fill fill) {
         logger.info("Processing fill: id={}, symbol={}, side={}, quantity={}", fill.getId(), fill.symbol(), fill.side(), fill.quantity());
-        Optional<Position> position = positionRepository.get(fill.symbol());
-        fillRepository.put(fill);
-        int quantity = fill.side() == Side.BUY ? fill.quantity() : -fill.quantity();
-        Position updatedPosition;
-        if (position.isPresent()) {
-            int newQuantity = position.get().netQuantity() + quantity;
-            updatedPosition = new Position(fill.symbol(), newQuantity, position.get().version() + 1, fill.getId());
-            logger.info("Updated existing position: symbol={}, newNetQuantity={}, version={}", updatedPosition.symbol(), updatedPosition.netQuantity(), updatedPosition.version());
-        } else {
-            updatedPosition = new Position(fill.symbol(), quantity, 0, fill.getId());
-            logger.info("Created new position: symbol={}, netQuantity={}", updatedPosition.symbol(), updatedPosition.netQuantity());
+        String symbol = fill.symbol();
+        Object lock = symbolLocks.computeIfAbsent(symbol, k -> new Object());
+        synchronized (lock) {
+            Optional<Position> position = positionRepository.get(symbol);
+            fillRepository.put(fill);
+            int quantity = fill.side() == Side.BUY ? fill.quantity() : -fill.quantity();
+            Position updatedPosition;
+            if (position.isPresent()) {
+                int newQuantity = position.get().netQuantity() + quantity;
+                updatedPosition = new Position(symbol, newQuantity, position.get().version() + 1, fill.getId());
+                logger.info("Updated existing position: symbol={}, newNetQuantity={}, version={}", updatedPosition.symbol(), updatedPosition.netQuantity(), updatedPosition.version());
+            } else {
+                updatedPosition = new Position(symbol, quantity, 0, fill.getId());
+                logger.info("Created new position: symbol={}, netQuantity={}", updatedPosition.symbol(), updatedPosition.netQuantity());
+            }
+            positionRepository.put(updatedPosition);
+            logger.info("Persisted position for symbol={}, emitting StateSnapshot to sink", symbol);
+            positionSink.tryEmitNext(new StateSnapshot(updatedPosition, fill));
         }
-        positionRepository.put(updatedPosition);
-        logger.info("Persisted position for symbol={}, emitting StateSnapshot to sink", fill.symbol());
-        positionSink.tryEmitNext(new StateSnapshot(updatedPosition, fill));
     }
 
     /**
@@ -250,12 +257,12 @@ public Mono<Void> submitFillRSocket(@Payload Fill fill) {
      *
      * @return a hot {@link Flux} of {@link StateSnapshot} items
      */
-@MessageMapping("state.stream")
-public Flux<StateSnapshot> streamPositions() {
-    if (!leaderElection.isLeader()) {
-        return Flux.error(new IllegalStateException("not leader — reconnect to current leader"));
-    }
-    Flux<StateSnapshot> currentState = Flux.fromIterable(positionRepository.getAll())
+    @MessageMapping("state.stream")
+    public Flux<StateSnapshot> streamPositions() {
+        if (!leaderElection.isLeader()) {
+            return Flux.error(new IllegalStateException("not leader — reconnect to current leader"));
+        }
+        Flux<StateSnapshot> currentState = Flux.fromIterable(positionRepository.getAll())
                 .map(position -> {
                     Fill lastFill = position.lastFillId() != null
                             ? fillRepository.get(position.lastFillId()).orElse(null)

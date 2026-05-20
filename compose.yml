@@ -295,7 +295,7 @@ services:
     image: market-maker
     build: .
     environment:
-      - SPRING_PROFILES_ACTIVE=market-maker-node,${QUOTE_GENERATOR_PROFILE:-test-quote-generator}
+      - SPRING_PROFILES_ACTIVE=market-maker-node,${QUOTE_GENERATOR_PROFILE:-test-quote-generator},fault-injection
       - ZOOKEEPER_CONNECT=zookeeper1:2181,zookeeper2:2181,zookeeper3:2181
       - CLUSTER_ADVERTISE_HOST=market-maker-node-1
       - CLUSTER_NODE_ID=market-maker-node-1
@@ -317,7 +317,7 @@ services:
     image: market-maker
     build: .
     environment:
-      - SPRING_PROFILES_ACTIVE=market-maker-node,${QUOTE_GENERATOR_PROFILE:-test-quote-generator}
+      - SPRING_PROFILES_ACTIVE=market-maker-node,${QUOTE_GENERATOR_PROFILE:-test-quote-generator},fault-injection
       - ZOOKEEPER_CONNECT=zookeeper1:2181,zookeeper2:2181,zookeeper3:2181
       - CLUSTER_ADVERTISE_HOST=market-maker-node-2
       - CLUSTER_NODE_ID=market-maker-node-2
@@ -339,7 +339,7 @@ services:
     image: market-maker
     build: .
     environment:
-      - SPRING_PROFILES_ACTIVE=market-maker-node,${QUOTE_GENERATOR_PROFILE:-test-quote-generator}
+      - SPRING_PROFILES_ACTIVE=market-maker-node,${QUOTE_GENERATOR_PROFILE:-test-quote-generator},fault-injection
       - ZOOKEEPER_CONNECT=zookeeper1:2181,zookeeper2:2181,zookeeper3:2181
       - CLUSTER_ADVERTISE_HOST=market-maker-node-3
       - CLUSTER_NODE_ID=market-maker-node-3
@@ -361,7 +361,7 @@ services:
     image: market-maker
     build: .
     environment:
-      - SPRING_PROFILES_ACTIVE=market-maker-node,${QUOTE_GENERATOR_PROFILE:-test-quote-generator}
+      - SPRING_PROFILES_ACTIVE=market-maker-node,${QUOTE_GENERATOR_PROFILE:-test-quote-generator},fault-injection
       - ZOOKEEPER_CONNECT=zookeeper1:2181,zookeeper2:2181,zookeeper3:2181
       - CLUSTER_ADVERTISE_HOST=market-maker-node-4
       - CLUSTER_NODE_ID=market-maker-node-4
@@ -383,7 +383,7 @@ services:
     image: market-maker
     build: .
     environment:
-      - SPRING_PROFILES_ACTIVE=market-maker-node,${QUOTE_GENERATOR_PROFILE:-test-quote-generator}
+      - SPRING_PROFILES_ACTIVE=market-maker-node,${QUOTE_GENERATOR_PROFILE:-test-quote-generator},fault-injection
       - ZOOKEEPER_CONNECT=zookeeper1:2181,zookeeper2:2181,zookeeper3:2181
       - CLUSTER_ADVERTISE_HOST=market-maker-node-5
       - CLUSTER_NODE_ID=market-maker-node-5
@@ -405,7 +405,7 @@ services:
     image: market-maker
     build: .
     environment:
-      - SPRING_PROFILES_ACTIVE=market-maker-node,${QUOTE_GENERATOR_PROFILE:-test-quote-generator}
+      - SPRING_PROFILES_ACTIVE=market-maker-node,${QUOTE_GENERATOR_PROFILE:-test-quote-generator},fault-injection
       - ZOOKEEPER_CONNECT=zookeeper1:2181,zookeeper2:2181,zookeeper3:2181
       - CLUSTER_ADVERTISE_HOST=market-maker-node-6
       - CLUSTER_NODE_ID=market-maker-node-6
@@ -427,7 +427,7 @@ services:
     image: market-maker
     build: .
     environment:
-      - SPRING_PROFILES_ACTIVE=market-maker-node,${QUOTE_GENERATOR_PROFILE:-test-quote-generator}
+      - SPRING_PROFILES_ACTIVE=market-maker-node,${QUOTE_GENERATOR_PROFILE:-test-quote-generator},fault-injection
       - ZOOKEEPER_CONNECT=zookeeper1:2181,zookeeper2:2181,zookeeper3:2181
       - CLUSTER_ADVERTISE_HOST=market-maker-node-7
       - CLUSTER_NODE_ID=market-maker-node-7
