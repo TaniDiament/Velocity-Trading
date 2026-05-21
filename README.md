@@ -1,4 +1,4 @@
-# Distributed Market Maker
+# Velocity Trading a Distributed Market Maker
 
 **Team Members:** Tani Diament, Shimmie Hahn, Yisroel Newmark, Matias Salem
 
