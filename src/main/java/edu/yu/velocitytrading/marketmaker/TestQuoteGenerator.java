@@ -8,9 +8,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 import org.springframework.context.annotation.Profile;
 import org.springframework.stereotype.Component;
 
-import edu.yu.velocitytrading.model.Fill;
-import edu.yu.velocitytrading.model.Position;
-import edu.yu.velocitytrading.model.Quote;
+import edu.yu.velocitytrading.model.*;
 
 @Component
 @Profile("test-quote-generator")

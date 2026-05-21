@@ -2,33 +2,21 @@ package edu.yu.velocitytrading.external;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import edu.yu.velocitytrading.ha.ServiceRegistry;
-import edu.yu.velocitytrading.model.ExternalOrder;
-import edu.yu.velocitytrading.model.Quote;
-import edu.yu.velocitytrading.model.Side;
+import edu.yu.velocitytrading.model.*;
 import edu.yu.velocitytrading.service.ServiceHealth;
 import jakarta.annotation.PostConstruct;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.context.annotation.Profile;
 import org.springframework.http.ResponseEntity;
-import org.springframework.web.bind.annotation.GetMapping;
-import org.springframework.web.bind.annotation.PostMapping;
-import org.springframework.web.bind.annotation.RequestBody;
-import org.springframework.web.bind.annotation.RequestParam;
-import org.springframework.web.bind.annotation.RestController;
+import org.springframework.web.bind.annotation.*;
 
 import java.io.IOException;
 import java.net.ConnectException;
 import java.net.URI;
-import java.net.http.HttpClient;
-import java.net.http.HttpRequest;
-import java.net.http.HttpResponse;
+import java.net.http.*;
 import java.time.Duration;
-import java.util.ArrayList;
-import java.util.List;
-import java.util.Optional;
-import java.util.Random;
-import java.util.UUID;
+import java.util.*;
 
 /**
  * Test-driven external-order publisher. Under the {@code external-publisher}
