@@ -8,7 +8,7 @@
 
 ## Overview
 
-> A distributed market maker that consumes exchange data and publishes quotes in real time, executing trades against them across a fault-tolerant cluster.
+Market makers are the middle men in modern trading activity who provide liquidity to an exchange by quoting buy and sell prices on assets. The market maker profits off the bid-ask spread while managing the underlying risk of its positions. The system must handle massive volumes of orders while maintaining consistent state throughout the cluster.
 
 What makes the system interesting:
 
@@ -57,6 +57,7 @@ compose.yml                # Local Docker Compose equivalent of the cluster
 ## Project Plan
 
 - [Scope (scenarios covered)](docs/scope.md)
+- [System Logic](docs/logic.md)
 - [Distributed System Challenges](docs/ds-challenges.md)
 - [Workflow Diagrams](docs/workflows.md)
 - [Error-Case Walkthroughs](docs/error-cases.md)
