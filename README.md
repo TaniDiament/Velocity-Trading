@@ -62,6 +62,7 @@ compose.yml                # Local Docker Compose equivalent of the cluster
 - [Workflow Diagrams](docs/workflows.md)
 - [Error-Case Walkthroughs](docs/error-cases.md)
 - [Software Architecture Diagrams](docs/architecture.md)
+- [Memory Architecture](docs/memory-architecture.md)
 - [Tools & Technologies](docs/technologies.md)
 
 ## Installation and Usage Guide
